@@ -4,12 +4,11 @@ import matplotlib.pyplot as plt
 import random
 import glob
 import numba as nb
-from multiprocessing import Pool
 import time
 from segment import Segment
+from statistics import mean
+from itertools import product
 
-
-@nb.jit
 def vertical_match(upper,lower):
     matches=[]
     for u in upper:
@@ -35,8 +34,8 @@ def label_iterative(x,y,img,display_img,R,G,B):
         display_img[x,y,1]=G
         display_img[x,y,2]=B
         
-        for i in [-1,0,1]:
-            for j in [-1,0,1]:
+        for i in range(-3,4):
+            for j in range(-3,4):
                 if i==0 and j == 0: continue
                 frontier.append((x+i,y+j))
                 
@@ -50,7 +49,7 @@ def labelfunc(img,tresh_bottom,tresh_up):
     
     return label_loop(new_img,img_hsv)
    
-@nb.jit  
+@nb.jit
 def label_loop(new_img,img_hsv):
     B=0
     segments = []
@@ -62,7 +61,7 @@ def label_loop(new_img,img_hsv):
                 B = B+1
                 segments.append(label_iterative(x,y,img_hsv,new_img,R,G,B))
      
-    segments = list(filter(lambda x: x.size > 200,segments))        
+    segments = list(filter(lambda x: x.size > 100,segments))        
     return new_img, segments
             
 def draw_match(img, match, scale):
@@ -80,16 +79,15 @@ def draw_match(img, match, scale):
         
     cv2.rectangle(img, up_left,down_right,(0,0,255),3)
                 
-def find(imdir, thresholds, training = False):
+def find(img, thresholds, video = False, training = False):
     start = time.time()
+    if not video: img_matches = cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
     
-    img = cv2.imread(imdir)
     orig_res=img.shape
-    img = cv2.medianBlur(img,15)
+    #if not video: img = cv2.medianBlur(img,15)
     
     img = cv2.resize(img,(800,450))
     img_cpy = np.copy(img)
-    img_matches = cv2.cvtColor(cv2.imread(imdir),cv2.COLOR_BGR2RGB)
     
     img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  
     
@@ -99,16 +97,11 @@ def find(imdir, thresholds, training = False):
     
     print(time.time()-start)
     
-    if not training:
-        """
-        print("torso")
-        list(map(lambda x: print(str(x)),segment_torso))
-        print("pants")
-        list(map(print,segment_pants))
-        print("matches")
-        list(map(print,matches))
-        """
-        
+    if training:
+        return matches,segment_torso,segment_pants
+    elif video:
+        return matches
+    else:
         for m in matches:
             draw_match(img_matches,m,orig_res[1]/800)
         
@@ -121,9 +114,96 @@ def find(imdir, thresholds, training = False):
         axs[1,0].imshow(img_matches)
         axs[1,1].imshow(img_hsv)
         plt.show()
+        return matches
+
+def vid_read(viddir,thresholds):
+    find_matches = lambda x: find(x,thresholds=thresholds,video=True)
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter('output.mp4',fourcc, 48.0, (1920,1080))    
+    cap = cv2.VideoCapture(viddir)
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        
+        matches = find_matches(frame)
+        for m in matches:
+            draw_match(frame,m,frame.shape[1]/800) 
+        
+        out.write(frame)
+        cv2.imshow('frame',frame)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break     
+        
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()        
+
+def avg_thresh(img, ground_truth, percentile, train_size = 10, precision = 2):
+    torso_pixels=[]
+    pants_pixels=[]
+    
+    hsv_img = cv2.cvtColor(img,cv2.COLOR_BGR2HSV)
+    for y in range(img.shape[0]):
+        for x in range(img.shape[1]):
+            if ground_truth[y,x,2] > 100:
+                torso_pixels.append(hsv_img[y,x])
+            elif ground_truth[y,x,0] > 100:
+                pants_pixels.append(hsv_img[y,x]) 
+    
+    best_matches = find(ground_truth,((110,10,10),(130,255,255),(0,10,10),(5,255,255)))    
+    best_score = -1
+    best_thresh = None
+    
+    for i,v,k,j in product(list(range(percentile,percentile+train_size,precision)), repeat=4):
+        current_thresh = [np.percentile(pants_pixels,v,axis=0),
+                          np.percentile(pants_pixels,100-v,axis=0),
+                          np.percentile(torso_pixels,k,axis=0),
+                          np.percentile(torso_pixels,100-j,axis=0)]
+        
+        current_matches,segment_torso,segment_pants = find(img.copy(),current_thresh, training=True)
+               
+        current_score = 0
+        for match in current_matches:
+            match_found=False
+            match_x = (match[0].x_max + match[0].x_min) / 2
+            match_y = (match[0].y_max + match[0].y_min) / 2
+            
+            for true_match in best_matches:
+                if match_x > true_match[0].x_min and match_x < true_match[0].x_max and match_y > true_match[0].y_min and match_y < true_match[0].y_max:
+                    current_score+=1
+                    match_found = True
+                    break
+                
+            if not match_found:
+                current_score -= 2 #penalize wrong matches
+                
+        print(current_score)
+        print(current_thresh)
+        print('\n')
+                
+        if current_score > best_score:
+            best_thresh = current_thresh
+            best_score = current_score
+        
+    print(best_thresh)    
+    print(best_score)
+    return best_thresh
 
 if __name__ == "__main__":
-    labels = glob.glob("sample_images\\*")
     
-    for i in range(4):
-        find(labels[i],thresholds=[(10,15,30),(30,70,137),(10,140,60),(80,255,255)])
+    vid_id = 1
+    
+    img = cv2.imread("sample_images\\{}.jpg".format(vid_id))
+    truth = cv2.imread("sample_truths\\{}.jpg".format(vid_id))
+    
+    thresholds = avg_thresh(img.copy(),truth,10,20,4)
+    find(img.copy(),thresholds)
+    
+    #[array([ 8., 21., 24.]), array([30., 81., 74.]), array([ 13., 119.,  45.]), array([ 18., 197., 158.])]
+    #thresholds = [(10,15,30),(30,70,137),(10,140,60),(80,255,255)]
+    
+    vid_read("sample_videos\\{}.mkv".format(vid_id),thresholds)
+    
