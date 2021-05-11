@@ -8,7 +8,9 @@ import time
 from segment import Segment
 from statistics import mean
 from itertools import product
+from multiprocessing import Pool
 
+@nb.jit
 def vertical_match(upper,lower):
     matches=[]
     for u in upper:
@@ -78,20 +80,21 @@ def draw_match(img, match, scale):
         down_right = (int(match[1].y_max*scale),int(match[1].x_max*scale))
         
     cv2.rectangle(img, up_left,down_right,(0,0,255),3)
-            
+       
 training_cache_p = {}
 training_cache_t = {}
 def find(img, thresholds, video = False, training = False):
-    start = time.time()
-    if not video: img_matches = cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
+    if not training: start = time.time()
     
-    orig_res=img.shape
-    #if not video: img = cv2.medianBlur(img,15)
-    
-    img = cv2.resize(img,(800,450))
-    img_cpy = np.copy(img)
-    
-    img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  
+    if not (training and str((thresholds[0],thresholds[1])) in training_cache_p and str((thresholds[2],thresholds[3])) in training_cache_t):
+        if not video: img_matches = cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
+        
+        orig_res=img.shape
+        
+        img = cv2.resize(img,(800,450))
+        img_cpy = np.copy(img)
+        
+        img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  
     
     if training and str((thresholds[0],thresholds[1])) in training_cache_p:
         segment_pants = training_cache_p[str((thresholds[0],thresholds[1]))]
@@ -104,10 +107,10 @@ def find(img, thresholds, video = False, training = False):
     else:
         img_torso, segment_torso = labelfunc(img_cpy,thresholds[2],thresholds[3])
         if training: training_cache_t[str((thresholds[2],thresholds[3]))] = segment_torso
-        
+
     matches = vertical_match(segment_torso,segment_pants)
     
-    print(time.time()-start)
+    if not training: print(time.time()-start)
     
     if training:
         return matches,segment_torso,segment_pants
@@ -153,6 +156,21 @@ def vid_read(viddir,thresholds):
     out.release()
     cv2.destroyAllWindows()        
 
+percentile_cache_t = {}
+percentile_cache_p = {}
+def cached_percentile(pixels,cutoff,torso):
+    if torso and cutoff in percentile_cache_t:
+        return percentile_cache_t[cutoff]
+    elif (not torso) and cutoff in percentile_cache_p:
+        return percentile_cache_p[cutoff]
+    
+    percentiles = np.percentile(pixels,cutoff,axis=0)
+    if torso:
+        percentile_cache_t[cutoff] = percentiles
+    else:
+        percentile_cache_p[cutoff] = percentiles
+    return percentiles
+
 def avg_thresh(img, ground_truth, percentile, train_size = 10, precision = 2):
     torso_pixels=[]
     pants_pixels=[]
@@ -165,41 +183,32 @@ def avg_thresh(img, ground_truth, percentile, train_size = 10, precision = 2):
             elif ground_truth[y,x,0] > 100:
                 pants_pixels.append(hsv_img[y,x]) 
     
-    """
-    colors = ('r','g','b')
-    fig, axs = plt.subplots(3,1)
-    for i in range(3):
-        axs[i].hist([v[i] for v in pants_pixels], bins = [*range(0,256,1)] ,color = colors[i])
-    plt.show()
-    """
-    
     best_matches = find(ground_truth,((110,10,10),(130,255,255),(0,10,10),(5,255,255)))    
     best_score = -1
     best_thresh = None
     bad_p_quartiles = []
     bad_t_quartiles = []
+    old_v=0
     
     for i,v,k,j in product(list(range(percentile,percentile+train_size,precision)), repeat=4):
         if (i,v) in bad_p_quartiles or (k,j) in bad_t_quartiles:
             continue
         
-        current_thresh = [np.percentile(pants_pixels,i,axis=0),
-                          np.percentile(pants_pixels,100-v,axis=0),
-                          np.percentile(torso_pixels,k,axis=0),
-                          np.percentile(torso_pixels,100-j,axis=0)]
-        
+        current_thresh = [cached_percentile(pants_pixels,i,torso=False),
+                          cached_percentile(pants_pixels,100-v,torso=False),
+                          cached_percentile(torso_pixels,k,torso=True),
+                          cached_percentile(torso_pixels,100-j,torso=True)]
+
         current_matches,segment_torso,segment_pants = find(img.copy(),current_thresh, training=True)
                
-        if len(segment_pants) == 0:
+        if len(segment_pants) <= best_score:
             bad_p_quartiles.append((i,v))
             continue
-        if len(segment_torso) == 0:
+        if len(segment_torso) <= best_score:
             bad_t_quartiles.append((k,j))
             continue
             
-               
         current_score = 0
-        
         match_positions = [] #to penalize double matches
         for match in current_matches:
             match_found=False
@@ -219,9 +228,9 @@ def avg_thresh(img, ground_truth, percentile, train_size = 10, precision = 2):
             if not match_found:
                 current_score -= 2 #penalize wrong matches
                 
-        print(current_score)
-        print(current_thresh)
-        print('\n')
+        if old_v != v:
+            print("best thresh =",best_thresh,"\ni =", i,"v =", v,"\nbest score =",best_score)
+            old_v = v
                 
         if current_score > best_score:
             best_thresh = current_thresh
@@ -238,7 +247,7 @@ if __name__ == "__main__":
     img = cv2.imread("sample_images\\{}.jpg".format(vid_id))
     truth = cv2.imread("sample_truths\\{}.jpg".format(vid_id))
     
-    thresholds = avg_thresh(img.copy(),truth,5,25,2)
+    thresholds = avg_thresh(img.copy(),truth,5,25,1)
     #thresholds = [(0,7,17),(22,70,68),(13,117,44),(19,216,183)]
     find(img.copy(),thresholds)
     
@@ -246,6 +255,7 @@ if __name__ == "__main__":
     #[array([ 6., 18., 22.]), array([110.,  89.,  80.]), array([ 13., 119.,  45.]), array([ 18., 188., 144.])]
     #thresholds = [(10,15,30),(30,70,137),(10,140,60),(80,255,255)]
     #advanced thresh = [(0,7,17),(22,70,68),(13,117,44),(19,216,183)]
+    #probably bad bu worth a shot [array([ 6., 20., 18.]), array([165.,  84.,  67.]), array([ 12., 119.,  40.]), array([ 19., 213., 160.])]
     
     vid_read("sample_videos\\{}.mkv".format(vid_id),thresholds)
     
